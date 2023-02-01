@@ -1,0 +1,506 @@
+#Import libraries
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+import lightgbm as lgb
+from datetime import timedelta
+from datetime import date
+import datetime
+
+
+
+#Read data
+df_main=pd.read_excel("Intake_case.xlsx",header=0)
+df_father=pd.read_excel("df_father.xlsx",header=0)
+df_mother=pd.read_excel("df_mother.xlsx",header=0)
+
+df_clients=pd.read_excel("Intake_case_client.xlsx",header=0)
+
+df_main
+
+
+
+
+# preprocess df_clients
+
+
+## obtain missing age values via NRIC
+def get_cyp_dob(dob,ic):
+    if (pd.isnull(dob)):
+        age = "0"
+        if ic[0] == 'S' and int(ic[1:3]) > 68:
+            age = "19" + ic[1:3] 
+        elif ic[0] == 'T' and ic[1:3].isnumeric():
+            age = "20" + ic[1:3]
+        else:
+            return dob
+        age = age + "0101"
+        dob = datetime.datetime.strptime(age, '%Y%m%d')
+        return dob
+    else:
+        return dob
+    
+        
+    
+
+def process_client_data(df):
+    
+    #Sort data by 'Created On' date and keep first instance
+    df['Created On'] = pd.Series(pd.to_datetime(df['Created On']))
+    df.sort_values(by=['Created On'], ascending=False, inplace=True)
+
+    #Format continuous data
+    df['Per Capita Income'] = (df['Per Capita Income'].map(lambda x: str(x).replace("$\u200e", "").replace(",", "")))
+    df['Per Capita Income'] = df['Per Capita Income'].map(lambda x: float(x))
+      
+    df["Household Size"] = df["Household Size"].map(lambda x: 1 if x == 0 else x)
+    
+    
+#     #Obtain age of clients from DOB, get age of outlier(s) from IC
+#     df['Date of Birth'] = pd.Series(pd.to_datetime(df['Date of Birth']))
+#     df['Age'] = ((df['Created On'] - df['Date of Birth']).dt.days/365).round()
+#     df['Age'] = df.apply(lambda x: get_cyp_age(x['Age'], x['ID Number'], x['Created On']), axis=1)
+#     df['Age'] = df['Age'].fillna(999)
+#     df['Age'] = df['Age'].astype(int)
+    
+#     #Gender: Bin client age + One-hot encoding + Create variables to count number of CYPs in age group + Create binary variables if they exist
+#     df['Age_Bin']=pd.cut(df.Age,bins=[0,3,6,9,12,14,16,18,900], labels=['Baby','Toddler','Lower Primary','Upper Primary','Lower Secondary','Upper Secondary','Post Secondary', 'Missing Age'])  
+#     age_bin_dummies=pd.get_dummies(df.Age_Bin,prefix='Age', dtype= int)
+#     df=pd.concat([df,age_bin_dummies],axis=1)
+#     df['Age'] = df['Age'].replace([999], np.nan)
+
+    
+    #Gender: One-hot encoding + Count CYPs by Gender and Intake No. + Create binary variables if they exist
+    gender_dummies=pd.get_dummies(df.Gender,prefix='Gender', dtype=int)
+    df=pd.concat([df,gender_dummies],axis=1)
+    
+    df['Number of Male CYPs'] = df.groupby('Enquiry No. (CP Intake)')['Gender_Male'].transform('sum')
+    df['Number of Male CYPs'].astype(int)
+    df['Number of Female CYPs'] = df.groupby('Enquiry No. (CP Intake)')['Gender_Female'].transform('sum')
+    df['Number of Female CYPs'].astype(int)
+    df['Number of CYPs Unknown Gender'] = 0
+    if 'Gender_Unknown' in df.columns:
+        df['Number of CYPs Unknown Gender'] = df.groupby('Enquiry No. (CP Intake)')['Gender_Unknown'].transform('sum')
+    df['Number of CYPs Unknown Gender'].astype(int)
+    
+    df['Male CYPs Exist']=df['Number of Male CYPs'].map(lambda x: 1 if x>0 else x)
+    df['Male CYPs Exist'].astype(int)
+    df['Female CYPs Exist']=df['Number of Female CYPs'].map(lambda x: 1 if x>0 else x)
+    df['Female CYPs Exist'].astype(int)
+    df['CYPs with Unknown Gender Exist']=df['Number of CYPs Unknown Gender'].map(lambda x: 1 if x>0 else x)
+    df['CYPs with Unknown Gender Exist'].astype(int)
+    
+    #Count number of CYPs in family by Intake No.
+    df['Number of CYPs'] = df['Enquiry No. (CP Intake)'].apply(lambda x: (df['Enquiry No. (CP Intake)'] == x).sum())
+    df['Number of CYPs'].astype(int)
+    df['Date of Birth'] = df.apply(lambda x : (get_cyp_dob(x['Date of Birth'], x['ID Number'])), axis = 1)
+
+#     df.drop_duplicates(subset=['Enquiry No. (CP Intake)'], inplace=True)
+    df = df.rename(columns={ "ID Number": "ID Number (Client)" })
+
+    return df
+
+df_clients_processed = process_client_data(df_clients)
+df_clients_processed
+
+##Drop fully duplicated rows of parent data
+
+df_father_processed = df_father.drop_duplicates(subset = ['ID Number (Client)'])
+df_mother_processed = df_mother.drop_duplicates(subset = ['ID Number (Client)'])
+def get_parent_age(date_of_birth, ic, id_type):
+    
+    if date_of_birth!= date_of_birth and (id_type == 'Singapore Pink Identification Card' or id_type == 'Singapore Blue Identification Card'):
+        age = "0"
+        if ic[0] == 'S' and int(ic[1:3]) > 68: 
+            age = "19" + ic[1:3] 
+        elif (ic[0] == "T"):
+            age = "20" + ic[1:3]
+        else:
+            return date_of_birth
+        age = age + "0101"
+        date_of_birth = datetime.datetime.strptime(age, '%Y%m%d')
+        return date_of_birth
+        
+        
+        
+    else:
+        return date_of_birth
+                
+df_father_processed['Date of Birth'] = df_father_processed.apply(lambda x : get_parent_age(x['Date of Birth'], x['ID Number'] , x['ID Type']),axis=1)
+df_mother_processed['Date of Birth'] = df_mother_processed.apply(lambda x : get_parent_age(x['Date of Birth'], x['ID Number'] , x['ID Type']),axis=1)
+
+#Dataset merging
+def join_dataset(main,client,father,mother):
+   
+    df_joined_dataset = main.merge(client, left_on = "Enquiry No.", right_on = "Enquiry No. (CP Intake)", how = 'left') #merge main with client
+    #multiple intake lines for a single enquiry
+    
+    
+    father = father.rename(columns={"ID Number": "ID Number - Father", "Date of Birth": "Date of Birth - Father", 'Is a Singapore PR?': 'Is a Singapore PR? - Father',
+                                   'Nationality' : 'Nationality - Father', 'Race': 'Race - Father', 'Household Member': 'Household Member - Father', 'ID Type': 'ID Type - Father',
+                                   'Person who Caused Harm to CYP' : "Person who Caused Harm to CYP - Father"})
+    mother = mother.rename(columns={"ID Number": "ID Number - Mother", "Date of Birth": "Date of Birth - Mother", 'Is a Singapore PR?': 'Is a Singapore PR? - Mother',
+                                   'Nationality' : 'Nationality - Mother', 'Race': 'Race - Mother', 'Household Member': 'Household Member - Mother', 'ID Type': 'ID Type - Mother',
+                                   'Person who Caused Harm to CYP' : "Person who Caused Harm to CYP - Mother"})
+    father_columns = ['ID Number (Client)', 'ID Number - Father', 'Date of Birth - Father', 'Is a Singapore PR? - Father', 'Nationality - Father', 'Race - Father', 'Household Member - Father', 'ID Type - Father','Person who Caused Harm to CYP - Father']
+    mother_columns = ['ID Number (Client)', 'ID Number - Mother', 'Date of Birth - Mother', 'Is a Singapore PR? - Mother', 'Nationality - Mother', 'Race - Mother', 'Household Member - Mother', 'ID Type - Mother','Person who Caused Harm to CYP - Mother']
+    
+    df_joined_dataset = df_joined_dataset.merge(father[father_columns], on= "ID Number (Client)", how = 'left')
+    df_joined_dataset = df_joined_dataset.merge(mother[mother_columns], on = "ID Number (Client)", how = 'left')
+    
+   
+    
+    df_joined_dataset = df_joined_dataset.drop_duplicates()
+    
+    
+    return df_joined_dataset
+
+df_joined_dataset = join_dataset(df_main,df_clients_processed,df_father_processed,df_mother_processed)
+df_joined_dataset
+
+def process_joined_dataset(df):
+    ##Group the intake cases to contain all the ID's of the children in the same intake
+    df_sorted = df.sort_values(by = "Created On")
+    df_sorted['ID Number (Client)'] = df_sorted['ID Number (Client)'].fillna("")
+    df1 = df_sorted.groupby('Enquiry No.')['ID Number (Client)'].agg(','.join).reset_index(name='Intake_ID_List')
+    df_sorted =df_sorted.sort_values(by = ['ID Number - Mother', 'ID Number - Father'])
+    
+    df_sorted = df_sorted.sort_values(by = "Enquiry No.")
+    df_sorted = df_sorted.reset_index(drop = True)
+    df1 = df1.sort_values(by = "Enquiry No.")
+    df1 = df1.reset_index(drop = True)
+    df = df_sorted.merge(df1, on = 'Enquiry No.' ,how = 'right')
+      
+    
+    df['Date of Birth'] = pd.to_datetime(df['Date of Birth'], errors ='coerce')
+    df['Age at Case Open Date - Child'] = ((df['Create On'] - df['Date of Birth']).dt.days/365).round()
+    df['Age_Bin'] = pd.cut(df['Age at Case Open Date - Child'], bins = [-1,3,6,9,12,14,16,18], labels = ['Baby','Toddler','Lower Primary','Upper Primary','Lower Secondary','Upper Secondary','Post Secondary'])
+    age_bin_dummies=pd.get_dummies(df.Age_Bin,prefix='Age', dtype= int)
+    df=pd.concat([df,age_bin_dummies],axis=1)
+    df['Mean Age'] = df[['Age at Case Open Date - Child','Enquiry No.']].groupby(['Enquiry No.']).transform('mean')
+
+    df['Number of Babies <3yo'] = df.groupby('Enquiry No.')['Age_Baby'].transform('sum')
+    df['Number of Toddler 3<=age<6'] = df.groupby('Enquiry No.')['Age_Toddler'].transform('sum')
+    df['Number of LowerPri 6<=age<9'] = df.groupby('Enquiry No.')['Age_Lower Primary'].transform('sum')
+    df['Number of UpperPri 9<=age<12'] = df.groupby('Enquiry No.')['Age_Upper Primary'].transform('sum')
+    df['Number of LowerSec 12<=age<14'] = df.groupby('Enquiry No.')['Age_Lower Secondary'].transform('sum')
+    df['Number of UpperSec 14<=age<16'] = df.groupby('Enquiry No.')['Age_Upper Secondary'].transform('sum')
+    df['Number of PostSec >16yo'] = df.groupby('Enquiry No.')['Age_Post Secondary'].transform('sum')
+    
+    df['Number of Babies <3yo exist'] = df['Number of Babies <3yo'].map(lambda x: int(1) if x>0 else x)
+    df['Number of Toddler 3<=age<6 exist'] = df['Number of Toddler 3<=age<6'].map(lambda x: int(1) if x>0 else x)
+    df['Number of LowerPri 6<=age<9 exist'] = df['Number of LowerPri 6<=age<9'].map(lambda x: int(1) if x>0 else x)
+    df['Number of UpperPri 9<=age<12 exist'] = df['Number of UpperPri 9<=age<12'].map(lambda x: int(1) if x>0 else x)
+    df['Number of LowerSec 12<=age<14 exist'] = df['Number of LowerSec 12<=age<14'].map(lambda x: int(1) if x>0 else x)
+    df['Number of UpperSec 14<=age<16 exist'] = df['Number of UpperSec 14<=age<16'].map(lambda x: int(1) if x>0 else x)
+    df['Number of PostSec >16yo exist'] = df['Number of PostSec >16yo'].map(lambda x: int(1) if x>0 else x)
+    
+
+    
+    return df,df1
+df_joined_dataset_processed,grouped_df= process_joined_dataset(df_joined_dataset)
+
+def parent_age(df):
+    df['Date of Birth - Father'] = pd.to_datetime(df['Date of Birth - Father'], errors='coerce')
+    df['Date of Birth - Mother'] = pd.to_datetime(df['Date of Birth - Mother'], errors='coerce')
+    df['Created On'] = pd.to_datetime(df['Created On'], errors = 'coerce')
+    # Age at Open Case Date - Father - regroup to bins 
+    # Blanks are coded as -1 as father data may not be available for particular case
+    
+    df['Age at Case Open Date - Father'] = ((df['Created On'] - df['Date of Birth - Father']).dt.days/365).round()
+    
+    # Age at Open Case Date - Mother - regroup to bins
+    # Blanks are coded as -1 as mother data may not be available for particular case
+    df['Age at Case Open Date - Mother'] = ((df['Created On'] - df['Date of Birth - Mother']).dt.days/365).round()
+
+    
+  
+    
+    # Reset index
+    df.reset_index(drop=True, inplace=True)
+    
+    return df
+
+df_joined_dataset_processed = parent_age(df_joined_dataset_processed)
+df=df_joined_dataset_processed
+
+# def get_rereport(main_dataset):
+#     duplicated_rows = main_dataset.loc[main_dataset['ID Number (Client)'].duplicated(keep = False)]
+#     duplicated_rows = duplicated_rows[['Enquiry No.', 'Create On', 'ID Number (Client)', 'Case Closure Date']]
+#     duplicated_rows.sort_values(by=['ID Number (Client)', 'Create On'], ascending=True, inplace=True)
+    
+    
+#     duplicated_rows.loc[(duplicated_rows['ID Number (Client)'] == duplicated_rows['ID Number (Client)'].shift(-1)), "Re-reported"] = 1
+#     duplicated_rows.loc[((duplicated_rows['Re-reported'].shift(1) == 1 ) & (duplicated_rows['Re-reported'] != 1)), "Re-reported"] = 2 ##Remove before using model as these are the latest instances of re-report, which should not be classified as not "re-reported"
+#     duplicated_rows.loc[((duplicated_rows['Re-reported'] == 1) & ((duplicated_rows['Create On'].shift(-1) - duplicated_rows['Case Closure Date']).dt.days < 365)), 'Re-reported within 1 year'] = 1
+#     duplicated_rows = duplicated_rows[['Enquiry No.', 'Re-reported', 'Re-reported within 1 year']]
+#     df = main_dataset.merge(duplicated_rows , on = ['Enquiry No.'], how = 'left')
+#     df['Re-reported'].fillna(0, inplace=True)
+#     df['Re-reported within 1 year'].fillna(0, inplace=True)
+#     df  = df.drop_duplicates(subset = 'Enquiry No.', keep = 'last')
+    
+    
+
+#     duplicated_rows.loc[(duplicated_rows['Intake_ID_Split'] == duplicated_rows['Intake_ID_Split'].shift(-1)),  "Re-reported"] = 1
+#     duplicated_rows.loc[((duplicated_rows['Re-reported'].shift(1) == 1) & (duplicated_rows['Re-reported'] != 1) & (duplicated_rows['Intake_ID_Split'].shift(1) == duplicated_rows['Intake_ID_Split'])) , 'Re-reported'] = 2 #2 is referencing to remove line later
+#     duplicated_rows.loc[((duplicated_rows['Re-reported'] == 1) & (duplicated_rows['Intake_ID_Split'].shift(-1) == duplicated_rows['Intake_ID_Split']) & ((duplicated_rows['Create On'].shift(-1) - duplicated_rows['Case Closure Date']).dt.days <365)), 'Re-reported within 1 year'] = 1
+#     duplicated_rows = duplicated_rows[['Enquiry No.', 'Re-reported' , 'Re-reported within 1 year']]
+#     df = main_dataset.merge(duplicated_rows, on = ['Enquiry No.'], how = 'left')
+#     df['Re-reported'].fillna(0, inplace=True)
+#     df['Re-reported within 1 year'].fillna(0, inplace=True)
+       
+    
+#     return df
+    
+# df = get_rereport(df_joined_dataset_processed)
+
+#Create binary variable for SDM Screening Result Final
+def screen_binary(df):
+    df['SDM Screening Result (Final)']=(df['SDM Screening Result (Final)']== "Screen In").astype(int)
+    return df
+df = screen_binary(df) 
+
+#Create dummy variable from Harm column for violence
+def searchKeyword_violence(df):
+    df = str(df)
+    df=df.split()
+    violence_keywords = ['harm', 'hit', 'violent', 'violence', 'physical', 'abuse', 'pain', 'slap', 'throw', 'abused', 'hurt', 'bite','bit', 'pinch','slap','pull','bruises','biting','scars','punched','abrasion','abrasions','strangle','force','forced','blood','bleed']
+    if any(word in df for word in violence_keywords):
+        return 1
+    else:
+        return 0
+df['Harm_violence']= [searchKeyword_violence(x) for x in df.Harm]
+
+#Create dummy variable from Harm column for sexual assault
+def searchKeyword_sexualAssault(df):
+    df = str(df)
+    df=df.split()
+    sexualAssault_keywords = ['touch','touched','touching','inappropriate','sex','molest','molested','sexual','harrassed','breasts','vagina','penis','trauma']
+    if any(word in df for word in sexualAssault_keywords):
+        return 1
+    else:
+        return 0
+df['Harm_sexualAssault']= [searchKeyword_sexualAssault(x) for x in df.Harm]
+
+#Create keyword search dummy variables for Referral Concerns
+def keywordSearch(df):
+    df=str(df)
+    df=df.split()
+    concern_keywords=['Alleged physical abuse', 'Neglect','Sexual Abuse', 'Sexualised Behaviours', 'Family Violence', 'Threat','Harm','Sexual','Abuse','Psychological','Hitting','emotional','Mental health']
+    if any(word in df for word in concern_keywords):
+        return 1
+    else:
+        return int(0)
+df['Concerned Case']= [keywordSearch(x) for x in df['Referral Concerns']]
+df_final=df
+ronr_df=df_final
+
+enquirynumbers=df['Enquiry No.']
+
+
+#Impute missing data as 'missing' category
+from sklearn.impute import SimpleImputer
+df_final.isnull().sum()/len(df_final)*100
+df_copy = df_final
+imp_mean = SimpleImputer(strategy='constant', fill_value='NA')
+imp_mean.fit(df_copy)
+SimpleImputer()
+df_copy = imp_mean.transform(df_copy)
+
+
+
+# function
+def binningfunc(df, col, bins, labels):
+    newcolname = col + "_Bin"
+    df[newcolname]=pd.cut(df[col], bins=bins, labels=labels)
+
+# create bins
+# bins = [-1000,0,10,20,30,40,50,60,70,80,90,100,1000]
+# labels=['0','0-10','11-20','21-30','31-40','41-50','51-60','61-70','71-80','81-90','91-100','>100']
+bins = [-1000,0,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,1000]
+labels=['0','0-5','6-10','11-15','16-20','21-25','26-30','31-35','36-40','41-45','46-50','51-55','56-60',
+        '61-65','66-70','71-75','76-80','81-85','86-90','91-95','96-100','>100']
+
+# bin age
+binningfunc(ronr_df, "Age at Case Open Date - Father", bins, labels)
+binningfunc(ronr_df, "Age at Case Open Date - Mother", bins, labels)
+
+
+# all variables
+
+columns_to_keep = [
+#  'Mean Age',
+# 'Case Status',
+ 'Source of Enquiry',
+#  'CARG Result',
+#  'CARG used?',
+ 'Mode of Enquiry',
+ 'Nature of Enquiry',
+ 'SDM Response Priority',
+ 'SDM Screening Result (Final)',
+#  'Re-reported',
+ 'Current Household Structure',
+ 'Household Dwelling Type',
+ 'Household Size',
+#  'Known To RPG',
+ 'No. of Bedrooms',
+ 'Purpose of Enquiry',
+ 'Number of Babies <3yo',
+ 'Number of Toddler 3<=age<6',
+ 'Number of LowerPri 6<=age<9',
+ 'Number of UpperPri 9<=age<12',
+ 'Number of LowerSec 12<=age<14',
+ 'Number of UpperSec 14<=age<16',
+ 'Number of PostSec >16yo',
+ 'Number of Male CYPs',
+ 'Number of Female CYPs',
+ 'Number of CYPs Unknown Gender',
+ 'Male CYPs Exist',
+ 'Female CYPs Exist',
+ 'CYPs with Unknown Gender Exist',
+ 'Number of CYPs',
+ 'Household Member - Father',
+ 'Person who Caused Harm to CYP - Father',
+ 'Household Member - Mother',
+ 'Re-report',
+ 'Person who Caused Harm to CYP - Mother',
+#  'Re-reported within 1 year',
+#  'Age at Case Open Date - Father',
+ 'Age at Case Open Date - Father_Bin',   
+#  'Age at Case Open Date - Mother',
+ 'Age at Case Open Date - Mother_Bin',
+ 'Harm_violence',
+ 'Harm_sexualAssault',
+ 'Concerned Case']
+
+# display the data kept
+ronr_df = ronr_df[columns_to_keep]
+ronr_df
+
+
+
+# ronr_df_ohe = pd.get_dummies(ronr_df, columns = ['Case Status', 'Source of Enquiry', 'CARG Result', 'CARG used?', 'Mode of Enquiry', 'Nature of Enquiry', 'SDM Response Priority',  'Household Dwelling Type', 'Household Size', 'Known To RPG', 'Purpose of Enquiry', 'Number of Babies <3yo', 'Number of Toddler 3<=age<6', 'Number of LowerPri 6<=age<9', 'Number of UpperPri 9<=age<12', 'Number of LowerSec 12<=age<14', 'Number of UpperSec 14<=age<16', 'Number of PostSec >16yo', 'Number of Male CYPs', 'Number of Female CYPs', 'Number of CYPs Unknown Gender', 'Male CYPs Exist', 'Female CYPs Exist', 'CYPs with Unknown Gender Exist', 'Number of CYPs', 'Household Member - Father', 'Person who Caused Harm to CYP - Father', 'Household Member - Mother', 'Re-report', 'Person who Caused Harm to CYP - Mother', 'Age at Case Open Date - Father_Bin', 'Age at Case Open Date - Mother_Bin', 'Harm_violence', 'Harm_sexualAssault', 'Concerned Case'],
+#                              prefix = ['Case Status', 'Source of Enquiry', 'CARG Result', 'CARG used?', 'Mode of Enquiry', 'Nature of Enquiry', 'SDM Response Priority',  'Household Dwelling Type', 'Household Size', 'Known To RPG', 'Purpose of Enquiry', 'Number of Babies <3yo', 'Number of Toddler 3<=age<6', 'Number of LowerPri 6<=age<9', 'Number of UpperPri 9<=age<12', 'Number of LowerSec 12<=age<14', 'Number of UpperSec 14<=age<16', 'Number of PostSec >16yo', 'Number of Male CYPs', 'Number of Female CYPs', 'Number of CYPs Unknown Gender', 'Male CYPs Exist', 'Female CYPs Exist', 'CYPs with Unknown Gender Exist', 'Number of CYPs', 'Household Member - Father', 'Person who Caused Harm to CYP - Father', 'Household Member - Mother', 'Re-report', 'Person who Caused Harm to CYP - Mother', 'Age at Case Open Date - Father_Bin', 'Age at Case Open Date - Mother_Bin', 'Harm_violence', 'Harm_sexualAssault', 'Concerned Case'],
+#                             dummy_na=True)
+# ronr_df_ohe
+ronr_df_ohe = pd.get_dummies(ronr_df,columns = ['Current Household Structure',
+#                                                'Case Status', 
+                                                'Source of Enquiry', 
+#                                                 'CARG Result', 
+#                                                 'CARG used?', 
+                                                'Mode of Enquiry',
+                                                'Nature of Enquiry', 
+                                                'SDM Response Priority', 
+                                                'Household Dwelling Type', 
+#                                                 'Known To RPG', 
+                                                'Purpose of Enquiry', 
+                                                'Household Member - Father',
+                                                'Person who Caused Harm to CYP - Father',
+                                                'Household Member - Mother',
+                                                'Re-report',
+                                                'Person who Caused Harm to CYP - Mother',
+#                                                 'Age at Case Open Date - Father_Bin',
+#                                                 'Age at Case Open Date - Mother_Bin'
+                                               ],
+                            prefix = ['Current Household Structure',
+#                                      'Case Status', 
+                                      'Source of Enquiry', 
+#                                       'CARG Result', 
+#                                       'CARG used?', 
+                                      'Mode of Enquiry', 
+                                      'Nature of Enquiry', 
+                                      'SDM Response Priority', 
+                                      'Household Dwelling Type', 
+#                                       'Known To RPG', 
+                                      'Purpose of Enquiry', 
+                                      'Household Member - Father', 
+                                      'Person who Caused Harm to CYP - Father', 
+                                      'Household Member - Mother',
+                                      'Re-report',
+                                      'Person who Caused Harm to CYP - Mother',
+#                                       'Age at Case Open Date - Father_Bin',
+#                                       'Age at Case Open Date - Mother_Bin'
+                                     ],
+                            dummy_na = True)
+
+# substitute space with no space (for lgbm to work)
+import re
+ronr_df_ohe = ronr_df_ohe.rename(columns = lambda x:re.sub('[^A-Za-z0-9_]+', '', x))
+for i in ronr_df_ohe.columns:
+    print(i)
+    
+# ronr_df_ohe['Rereportedwithin1year'].value_counts()
+# X = ronr_df_ohe.drop(['Rereportedwithin1year', 'Rereported'], axis = 1)
+# y = ronr_df_ohe['Rereportedwithin1year']
+
+
+feature_names = ['HouseholdSize',  'NumberofBabies3yo',
+ 'NumberofToddler3age6',
+ 'NumberofLowerPri6age9',
+ 'NumberofUpperPri9age12',
+ 'NumberofLowerSec12age14',
+ 'NumberofUpperSec14age16',
+ 'NumberofPostSec16yo',
+ 'NumberofMaleCYPs',
+ 'NumberofFemaleCYPs',
+ 'NumberofCYPsUnknownGender',
+ 'NumberofCYPs',
+ 'NoofBedrooms'
+            ] ##Features that need to be categorized 
+
+X=ronr_df_ohe
+X[feature_names] = X[feature_names].astype("category")
+X[feature_names] = X[feature_names].apply(pd.to_numeric, errors='coerce', axis=1)
+
+pd.set_option('display.max_columns', None)
+
+
+
+
+X
+X = X.drop(['SDMScreeningResultFinal'], axis = 1)
+#Export df dataset
+
+#writing to Excel
+dfdatatoexcel = pd.ExcelWriter('df.xlsx')
+  
+# write DataFrame to excel
+X.to_excel(dfdatatoexcel)
+  
+# save the excel
+dfdatatoexcel.save()
+print('DataFrame is written to Excel File successfully.')
+list(X)
+
+
+
+
+import joblib
+
+model=joblib.load("model_rereport_joblib v32.pkl")
+
+
+predicted_probability=model.predict(X, predict_disable_shape_check=True)
+np.set_printoptions(suppress=True)
+
+banding = list(map(lambda x: int(math.ceil(10*x)),predicted_probability))
+
+enquiryprobability=pd.DataFrame(list(zip(enquirynumbers, predicted_probability, banding)))
+headers =  ["Enquiry No,", "Predicted Probability of Re-entry", "Risk Score"]
+enquiryprobability.columns = headers
+enquiryprobability
+
+
+
+
+#writing to Excel
+dfdatatoexcel = pd.ExcelWriter('prob.xlsx')
+  
+# write DataFrame to excel
+enquiryprobability.to_excel(dfdatatoexcel)
+  
+# save the excel
+dfdatatoexcel.save()
+print('DataFrame is written to Excel File successfully.')
